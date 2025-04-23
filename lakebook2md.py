@@ -3,8 +3,9 @@ import re
 import json
 import yaml
 import tarfile
-from bs4 import BeautifulSoup
+import shutil
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 
 class LakebookConverter:
@@ -12,24 +13,33 @@ class LakebookConverter:
         self.input_path = ""
         self.output_base = Path("output")
         self.temp_dir = Path(".laketmp")
+        self.processed_files = set()
 
     def get_user_input(self):
-        """获取用户输入的lakebook文件路径"""
-        print("请将.lakeb文件拖入此窗口，或直接输入文件路径：")
+        """获取用户输入的路径（文件或文件夹）"""
+        print("请将.lakebook文件或文件夹拖入此窗口，或直接输入路径：")
         while True:
-            path = input("> ").strip('"\' ')  # 去除可能的引号和空格
-            if os.path.isfile(path) and path.endswith('.lakeb'):
-                self.input_path = Path(path)
-                break
-            print("❌ 无效路径，请重新输入有效的.lakeb文件路径：")
+            path = input("> ").strip('"\' ')
+            path_obj = Path(path)
 
-    def extract_lakebook(self):
-        """解压lakebook文件"""
+            if path_obj.is_file() and path.endswith('.lakebook'):
+                self.input_path = path_obj
+                return "file"
+            elif path_obj.is_dir():
+                self.input_path = path_obj
+                return "dir"
+            else:
+                print("❌ 无效路径，请重新输入有效的.lakebook文件或包含.lakebook文件的文件夹路径：")
+
+    def extract_lakebook(self, lakebook_path):
+        """解压单个lakebook文件"""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+
         self.temp_dir.mkdir(exist_ok=True)
-        with tarfile.open(self.input_path) as tar:
+        with tarfile.open(lakebook_path) as tar:
             tar.extractall(self.temp_dir)
 
-        # 获取解压后的主目录
         for item in self.temp_dir.iterdir():
             if item.is_dir() and not item.name.startswith('.'):
                 return item
@@ -39,7 +49,6 @@ class LakebookConverter:
         """将HTML转换为Markdown"""
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # 转换各种HTML标签为Markdown
         for tag in soup.find_all(["p", "br"]):
             tag.insert_after("\n\n")
 
@@ -59,7 +68,6 @@ class LakebookConverter:
             text = a.get_text()
             a.replace_with(f"[{text}]({href})")
 
-        # 清理多余空格和换行
         markdown = str(soup)
         markdown = re.sub(r"\n{3,}", "\n\n", markdown)
         markdown = re.sub(r" {2,}", " ", markdown)
@@ -70,6 +78,11 @@ class LakebookConverter:
         title = doc_data.get("title", "未命名文档")
         doc_file = book_dir / f"{doc_data['url']}.json"
 
+        doc_id = doc_data.get("uuid", doc_file.name)
+        if doc_id in self.processed_files:
+            return False
+        self.processed_files.add(doc_id)
+
         try:
             with open(doc_file, "r", encoding="utf-8") as f:
                 content = json.load(f)
@@ -77,9 +90,11 @@ class LakebookConverter:
             html_content = content["doc"]["body"]
             markdown = self.convert_html_to_markdown(html_content)
 
-            # 创建安全的文件名
             safe_title = re.sub(r'[\\/*?:"<>|]', '_', title)
             output_file = output_folder / f"{safe_title}.md"
+
+            if output_file.exists():
+                output_file.unlink()
 
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\n{markdown}")
@@ -91,11 +106,15 @@ class LakebookConverter:
             print(f"✗ 转换失败 [{title}]: {str(e)}")
             return False
 
-    def process_book(self, book_dir):
-        """处理整个lakebook"""
+    def process_single_lakebook(self, lakebook_path):
+        """处理单个lakebook文件"""
+        book_dir = self.extract_lakebook(lakebook_path)
+        if not book_dir:
+            return False
+
         meta_file = book_dir / "$meta.json"
         if not meta_file.exists():
-            print("❌ 找不到元数据文件 $meta.json")
+            print(f"❌ 找不到元数据文件 $meta.json ({lakebook_path.name})")
             return False
 
         with open(meta_file, "r", encoding="utf-8") as f:
@@ -103,11 +122,10 @@ class LakebookConverter:
 
         toc = yaml.safe_load(json.loads(meta["meta"])["book"]["tocYml"])
 
-        # 创建输出文件夹 (使用lakebook文件名)
-        output_folder = self.output_base / self.input_path.stem
+        output_folder = self.output_base / lakebook_path.stem
         output_folder.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n正在转换: {self.input_path.name}")
+        print(f"\n正在转换: {lakebook_path.name}")
         print(f"输出到: {output_folder}\n")
 
         success_count = 0
@@ -116,26 +134,45 @@ class LakebookConverter:
                 if self.process_doc(item, book_dir, output_folder):
                     success_count += 1
 
-        print(f"\n✅ 转换完成! 成功转换 {success_count} 个文档")
+        print(f"\n✅ 转换完成! 成功转换 {success_count} 个文档 ({lakebook_path.name})")
+        return True
+
+    def process_directory(self):
+        """处理目录下的所有lakebook文件"""
+        lakebook_files = list(self.input_path.glob("*.lakebook"))
+        if not lakebook_files:
+            print(f"❌ 文件夹中没有找到.lakebook文件: {self.input_path}")
+            return False
+
+        print(f"\n找到 {len(lakebook_files)} 个.lakebook文件:")
+        for i, file in enumerate(lakebook_files, 1):
+            print(f"{i}. {file.name}")
+
+        total_success = 0
+        for lakebook in lakebook_files:
+            if self.process_single_lakebook(lakebook):
+                total_success += 1
+
+        print(f"\n🎉 全部完成! 成功转换 {total_success}/{len(lakebook_files)} 个.lakebook文件")
         return True
 
     def clean_up(self):
         """清理临时文件"""
         if self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def run(self):
         try:
             self.output_base.mkdir(exist_ok=True)
-            self.get_user_input()
+            input_type = self.get_user_input()
 
-            book_dir = self.extract_lakebook()
-            if book_dir:
-                self.process_book(book_dir)
+            if input_type == "file":
+                self.process_single_lakebook(self.input_path)
+            else:
+                self.process_directory()
 
         except Exception as e:
             print(f"❌ 发生错误: {str(e)}")
-
         finally:
             self.clean_up()
 
